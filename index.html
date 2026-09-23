@@ -63,6 +63,10 @@
             <div class="flex items-center gap-2">
                 <span id="toast" class="hidden sm:inline text-xs text-slate-400 max-w-[22rem] truncate"></span>
                 <span id="sessionCost" class="text-xs font-mono text-slate-400" title="Input tokens and cost for this session"></span>
+                <button id="undoBtn" class="hidden items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-md hover:bg-amber-100">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a5 5 0 010 10h-3M3 10l4-4M3 10l4 4"></path></svg>
+                    <span id="undoLabel">Undo</span>
+                </button>
                 <button id="openLibBtn" class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-slate-600 hover:text-indigo-600 hover:bg-indigo-50 rounded-md transition-colors border border-transparent hover:border-indigo-100">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10a2 2 0 002 2h12a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H6a2 2 0 00-2 2z"></path></svg>
                     Library
@@ -724,13 +728,76 @@ const el = {};
  "outTabs", "outBody", "outMeta", "copyOutBtn", "loadingIndicator", "outNav",
  "stateSection", "questionsSection", "resultsSection",
  "modalBackdrop", "modalTitle", "modalDesc", "modalBody", "modalCancel", "modalConfirm",
- "openLibBtn", "libBackdrop", "libClose", "libTabs", "libToolbar", "libBody", "libImportAll", "libExportAll", "libRestore"
+ "undoBtn", "undoLabel", "openLibBtn", "libBackdrop", "libClose", "libTabs", "libToolbar", "libBody", "libImportAll", "libExportAll", "libRestore"
 ].forEach(function (id) { el[id] = document.getElementById(id); });
 
 function toast(msg) {
     el.toast.textContent = msg;
     clearTimeout(toast.t);
     toast.t = setTimeout(function () { el.toast.textContent = ""; }, 3500);
+}
+
+/* ------------------------------ undo ------------------------------ *
+ * One step, which is what "undo the last action" means here. Anything that
+ * replaces or removes something the user cannot retype in a second registers
+ * how to put it back; the header button is the only way in, so it never
+ * competes with Ctrl+Z inside a text field.
+ * ------------------------------------------------------------------ */
+
+let undoEntry = null;
+
+function renderUndo() {
+    if (!el.undoBtn) return;
+    el.undoBtn.classList.toggle("hidden", !undoEntry);
+    el.undoBtn.classList.toggle("flex", !!undoEntry);
+    if (undoEntry) {
+        el.undoLabel.textContent = "Undo " + undoEntry.label;
+        el.undoBtn.title = "Put back what " + undoEntry.label + " changed";
+    }
+}
+
+/** Register how to reverse what is about to happen. */
+function rememberUndo(label, fn) {
+    undoEntry = { label: label, run: fn };
+    renderUndo();
+}
+
+function clearUndo() { undoEntry = null; renderUndo(); }
+
+el.undoBtn.addEventListener("click", runUndo);
+
+function runUndo() {
+    if (!undoEntry) return;
+    const e = undoEntry;
+    undoEntry = null;
+    renderUndo();
+    try { e.run(); toast("Undid " + e.label); }
+    catch (err) { toast("Could not undo: " + err.message); }
+}
+
+/** Everything the two editors hold, cloned, so it can be put back verbatim. */
+function editorSnapshot() {
+    return { stMode: st.mode, stText: st.text, stRoot: clone(st.root),
+             qMode: qs.mode, qText: qs.text, qList: clone(qs.list),
+             qThresholds: clone(qs.thresholds), globals: globalBandSnapshot() };
+}
+
+function restoreEditors(snap) {
+    st.mode = snap.stMode; st.text = snap.stText; st.root = clone(snap.stRoot);
+    qs.mode = snap.qMode; qs.text = snap.qText; qs.list = clone(snap.qList);
+    qs.thresholds = clone(snap.qThresholds);
+    applyGlobalBands(snap.globals);
+    paintStateMode();
+    paintQuestionsMode();
+    syncDerived();
+    saveDraft();
+}
+
+/** Snapshot the editors, then do the thing. */
+function undoableEdit(label, fn) {
+    const snap = editorSnapshot();
+    rememberUndo(label, function () { restoreEditors(snap); });
+    fn();
 }
 
 /* ----------------------------- modal ------------------------------ */
@@ -766,8 +833,20 @@ function openModal(opts) {
 
     modalOnConfirm = function () { return opts.onConfirm ? opts.onConfirm(field ? field.value : null) : true; };
     el.modalBackdrop.classList.remove("hidden");
-    (field || el.modalConfirm).focus();
+    /* a destructive dialog answers "no" until the user says otherwise, so the
+       focus lands on Cancel and Enter cannot confirm it by reflex */
+    (field || (opts.danger ? el.modalCancel : el.modalConfirm)).focus();
     if (field && opts.input && field.select) field.select();
+}
+
+/** Ask before doing something destructive. Cancel is the default answer. */
+function confirmDanger(opts, onYes) {
+    openModal({
+        title: opts.title, desc: opts.desc || "",
+        confirmText: opts.confirmText || "Delete", cancelText: opts.cancelText || "Cancel",
+        danger: true,
+        onConfirm: function () { onYes(); return true; }
+    });
 }
 
 function closeModal() { el.modalBackdrop.classList.add("hidden"); modalOnConfirm = null; }
@@ -806,9 +885,15 @@ function iconBtn(icon, title, onClick, extra) {
                          title: title, "aria-label": title, type: "button", html: icon, onclick: onClick });
 }
 
-function trashBtn(title, onClick) {
+/** A delete button. It always asks first; pass `skipConfirm` only where the
+ *  caller opens its own dialog. */
+function trashBtn(title, onClick, what, skipConfirm) {
     return h("button", { class: "p-1 rounded text-red-500 hover:text-red-700 hover:bg-red-50",
-                         title: title, "aria-label": title, type: "button", html: ICON.trash, onclick: onClick });
+                         title: title, "aria-label": title, type: "button", html: ICON.trash,
+        onclick: skipConfirm ? onClick : function () {
+            confirmDanger({ title: "Delete " + (what || "this") + "?",
+                            desc: "The Undo button in the header puts it back." }, onClick);
+        } });
 }
 
 function chip(text, accent) {
@@ -955,9 +1040,9 @@ function renderField(f, parent, depth, ctx) {
             parent.children.splice(parent.children.indexOf(f) + 1, 0, c);
             ctx.rerender(); touched();
         }));
-        actions.appendChild(trashBtn("Remove", function () {
+        actions.appendChild(trashBtn("Remove", function () { undoableEdit("that field", function () {
             parent.children.splice(parent.children.indexOf(f), 1); ctx.rerender(); touched();
-        }));
+        } ); }, (f.key || "this field"), false));
     }
     row.appendChild(actions);
 
@@ -1114,9 +1199,9 @@ function renderQuestion(q) {
         c.key = q.key ? q.key + "_copy" : "";
         qs.list.splice(qs.list.indexOf(q) + 1, 0, c); renderQuestions(); touched();
     }));
-    acts.appendChild(trashBtn("Remove", function () {
+    acts.appendChild(trashBtn("Remove", function () { undoableEdit("that question", function () {
         qs.list.splice(qs.list.indexOf(q), 1); renderQuestions(); touched();
-    }));
+    } ); }, (q.key || "this question"), false));
     head.appendChild(acts);
     card.appendChild(head);
     if (q.collapsed) return card;
@@ -1191,7 +1276,7 @@ function renderQuestion(q) {
                 h("input", { class: "ctl border-slate-300 font-mono w-[8rem] shrink-0", value: op.key, placeholder: "option", "aria-label": "Option value",
                     oninput: function (ev) { op.key = ev.target.value; touched(); } }),
                 entryEditor(op.desc, "when to pick it", "Option criteria"),
-                trashBtn("Remove option", function () { q.options.splice(q.options.indexOf(op), 1); renderQuestions(); touched(); })
+                trashBtn("Remove option", function () { undoableEdit("that option", function () { q.options.splice(q.options.indexOf(op), 1); renderQuestions(); touched(); }); }, "this option")
             ]));
         });
         body.appendChild(smallBtn("Add option", function () { q.options.push({ key: "", desc: newEntry("") }); renderQuestions(); touched(); }));
@@ -1206,7 +1291,7 @@ function renderQuestion(q) {
                 entryEditor(lv, "what this level means", "Level " + i),
                 iconBtn(ICON.up, "Move up", function () { if (i > 0) { const t = q.levels[i - 1]; q.levels[i - 1] = q.levels[i]; q.levels[i] = t; renderQuestions(); touched(); } }),
                 iconBtn(ICON.down, "Move down", function () { if (i < q.levels.length - 1) { const t = q.levels[i + 1]; q.levels[i + 1] = q.levels[i]; q.levels[i] = t; renderQuestions(); touched(); } }),
-                trashBtn("Remove level", function () { q.levels.splice(i, 1); renderQuestions(); touched(); })
+                trashBtn("Remove level", function () { undoableEdit("that level", function () { q.levels.splice(i, 1); renderQuestions(); touched(); }); }, "this level")
             ]));
         });
         body.appendChild(smallBtn("Add level", function () { q.levels.push(newEntry("")); renderQuestions(); touched(); }));
@@ -1900,6 +1985,9 @@ function importDoc(store) {
                     if (v && Object.prototype.hasOwnProperty.call(v, k)) put(kept, k, source[k]);
                 });
             }
+            rememberUndo("that import", (function (snap) {
+                return function () { restoreEditors(snap); };
+            })(editorSnapshot()));
             loadDocQuiet(store, { mode: mode, value: v, thresholds: store === "questions" ? kept : undefined });
             if (incomingGlobal) {
                 applyGlobalBands(incomingGlobal);
@@ -2163,8 +2251,14 @@ function currentThresholdConfig() {
  *  loaded set is exactly what was saved. */
 function applyThresholdConfig(cfg, label) {
     if (!cfg || typeof cfg !== "object") { toast("That is not a threshold set"); return false; }
+    const before = { overrides: clone(qs.thresholds), globals: globalBandSnapshot() };
     if (!applyGlobalBands(cfg)) { toast("No usable bands in that set"); return false; }
     qs.thresholds = normaliseBandMap(cfg.overrides || {});
+    rememberUndo("those thresholds", function () {
+        qs.thresholds = normaliseBandMap(before.overrides);
+        applyGlobalBands(before.globals);
+        saveDraft(); paintQuestionsMode(); syncDerived(); renderOut();
+    });
     saveDraft();
     paintQuestionsMode();
     syncDerived();
@@ -2752,6 +2846,9 @@ function renderDiff(a, b) {
 /** Replace the editors from a run's payload. `which` is state, questions or both. */
 function usePayload(payload, label, which) {
     if (!payload) { toast("That run has no payload"); return; }
+    rememberUndo("that replacement", (function (snap) {
+        return function () { restoreEditors(snap); };
+    })(editorSnapshot()));
     if (which !== "questions" && payload.state !== undefined) {
         if (typeof payload.state === "string") { st.text = payload.state; st.mode = "text"; }
         else { st.root = valueToField("", payload.state); st.mode = "builder"; }
@@ -2770,6 +2867,16 @@ function usePayload(payload, label, which) {
 }
 
 function removeGroup(id) {
+    const gone = groups.filter(function (g) { return g.id === id; })[0];
+    const at = groups.map(function (g) { return g.id; }).indexOf(id);
+    const wasSel = selectedId, wasA = diffA, wasB = diffB;
+    if (gone) {
+        rememberUndo("removing that run", function () {
+            groups.splice(Math.max(0, at), 0, gone);
+            selectedId = wasSel; diffA = wasA; diffB = wasB;
+            saveRuns(); renderOut();
+        });
+    }
     groups = groups.filter(function (g) { return g.id !== id; });
     if (selectedId === id) selectedId = groups.length ? groups[0].id : null;
     if (diffA === id) diffA = null;
@@ -2786,48 +2893,82 @@ function copyGroup(g) {
                                      globalThresholds: g.globalThresholds || globalBandSnapshot() }, null, 2), "Run");
 }
 
+/** What can be loaded for whatever is in the editors: the exact example if
+ *  there is one, otherwise the two half-matches, otherwise an explanation.
+ *  Nothing here renders as a dead button. */
+function runOffers(compact) {
+    const wrap = h("div", { class: compact ? "mb-1.5" : "" });
+    const hit = applicableRuns();
+    const pending = pendingRuns(hit.runs);
+    const sc = runScopes();
+    const row = h("div", { class: "flex gap-2 flex-wrap items-center" });
+    let any = false;
+
+    if (pending.length) {
+        any = true;
+        row.appendChild(smallBtn(applicableLabel(hit, pending), function () { loadRunRecords(pending); },
+            "indigo", applicableTitle(hit)));
+    }
+    if (sc.sameStateOtherQuestions.length) {
+        any = true;
+        row.appendChild(smallBtn("This state, other questions (" + sc.sameStateOtherQuestions.length + ")",
+            function () { openRunScope("sameStateOtherQuestions"); }, "plain",
+            "Open the library filtered to runs about this same state, judged by a different question set"));
+    }
+    if (sc.sameQuestionsOtherState.length) {
+        any = true;
+        row.appendChild(smallBtn("These questions, other states (" + sc.sameQuestionsOtherState.length + ")",
+            function () { openRunScope("sameQuestionsOtherState"); }, "plain",
+            "Open the library filtered to runs judged by this same question set, about a different state"));
+    }
+    row.appendChild(smallBtn("Browse all saved runs", function () { libRunScope = null; openLibrary("runs", ""); }, "plain",
+        "Every run in the library"));
+    wrap.appendChild(row);
+
+    if (!any && !compact) {
+        /* Nothing matched. That is the normal case for a state you wrote
+           yourself, so say what matching means rather than showing a refusal. */
+        wrap.appendChild(h("p", { class: "mt-2 text-[11px] text-slate-500",
+            text: "A saved run is tied to the state and the question set that produced it, so runs only appear here once " +
+                  "those match what is in the editors. Nothing in the library matches this one yet. Run it, then Save as " +
+                  "to keep the result and it will be offered here next time." }));
+    } else if (hit.how === "pair" && hit.state && hit.questions && !compact) {
+        wrap.appendChild(h("p", { class: "mt-2 text-[11px] text-slate-500",
+            text: "Matched on " + hit.state.name + " judged by " + hit.questions.name + "." }));
+    }
+    return wrap;
+}
+
 function renderRuns() {
     el.outMeta.textContent = groups.length + (groups.length === 1 ? " run" : " runs") + " in this tab";
     if (!groups.length) {
         el.outBody.appendChild(h("p", { class: "text-slate-500 text-sm mb-3",
             text: "No runs in this tab yet. The list lives in the tab and is not written to disk; Save keeps one in the library." }));
-        const hit = applicableRuns();
-        const pending = pendingRuns(hit.runs);
-        const row = h("div", { class: "flex gap-2 flex-wrap" }, [
-            smallBtn(applicableLabel(hit, pending), function () { loadRunRecords(pending); },
-                pending.length ? "indigo" : "plain", applicableTitle(hit))
-        ]);
-        row.appendChild(smallBtn("Browse all example runs", function () { openLibrary("runs", ""); }, "plain",
-            "The published Opus, Sol, TypeSafe and reference answers for every example"));
-        el.outBody.appendChild(row);
-        if (hit.runs.length) {
-            el.outBody.appendChild(h("p", { class: "mt-2 text-[11px] text-slate-500",
-                text: hit.how === "pair"
-                    ? "Matched on " + hit.state.name + " judged by " + hit.questions.name + "."
-                    : "Only one side of the example matched, so this is the wider set." }));
-        }
+        el.outBody.appendChild(runOffers());
         return;
     }
     const head = h("div", { class: "mb-3 pb-2 border-b border-slate-200" });
     head.appendChild(h("p", { class: "text-[11px] text-slate-500 mb-1.5", text: "newest first · pick A and B to compare" }));
+    head.appendChild(runOffers(true));
     /* the buttons get a line to themselves, so no text reads as a label for them */
     const headActs = h("div", { class: "flex items-center gap-2 flex-wrap" });
     if (diffA || diffB) {
         headActs.appendChild(h("button", { type: "button", class: "text-[11px] text-slate-600 border border-slate-300 rounded px-2 py-0.5 hover:bg-slate-50",
             onclick: function () { diffA = null; diffB = null; renderOut(); } }, ["Clear A and B"]));
     }
-    const hit = applicableRuns();
-    const pending = pendingRuns(hit.runs);
-    /* once the example's run is in the list there is nothing left to load, so
-       the button goes rather than sitting there doing nothing */
-    if (pending.length) {
-        headActs.appendChild(h("button", { type: "button", class: "text-[11px] text-indigo-700 border border-indigo-200 bg-indigo-50 rounded px-2 py-0.5 hover:bg-indigo-100",
-            title: applicableTitle(hit), onclick: function () { loadRunRecords(pending); } }, [applicableLabel(hit, pending)]));
-    }
     headActs.appendChild(h("button", { type: "button", class: "text-[11px] text-slate-600 border border-slate-300 rounded px-2 py-0.5 hover:bg-slate-50",
         title: "Open the library to load a published run to compare against", onclick: function () { openLibrary("runs", ""); } }, ["Load"]));
     headActs.appendChild(h("button", { type: "button", class: "text-[11px] text-rose-600 border border-rose-200 rounded px-2 py-0.5 hover:bg-rose-50",
-        onclick: function () { groups = []; selectedId = null; diffA = null; diffB = null; saveRuns(); renderOut(); } }, ["Clear history"]));
+        onclick: function () {
+            confirmDanger({ title: "Clear the run history?", confirmText: "Clear",
+                            desc: "Removes every run from this tab. The Undo button puts them back." }, function () {
+                const old = groups, oS = selectedId, oA = diffA, oB = diffB;
+                rememberUndo("clearing the history", function () {
+                    groups = old; selectedId = oS; diffA = oA; diffB = oB; saveRuns(); renderOut();
+                });
+                groups = []; selectedId = null; diffA = null; diffB = null; saveRuns(); renderOut();
+            });
+        } }, ["Clear history"]));
     head.appendChild(headActs);
     el.outBody.appendChild(head);
 
@@ -2877,7 +3018,7 @@ function renderRuns() {
                 applyRunThresholds({ name: g.label, thresholds: g.thresholds, globalThresholds: g.globalThresholds });
             }));
         }
-        acts.appendChild(trashBtn("Remove this run from the list", function () { removeGroup(g.id); }));
+        acts.appendChild(trashBtn("Remove this run from the list", function () { removeGroup(g.id); }, "this run from the list"));
         row.appendChild(acts);
         el.outBody.appendChild(row);
     });
@@ -3427,6 +3568,9 @@ function loadDocQuiet(store, rec) {
 }
 
 function loadDoc(store, rec) {
+    rememberUndo("loading " + recordName(store, rec), (function (snap) {
+        return function () { restoreEditors(snap); };
+    })(editorSnapshot()));
     loadDocQuiet(store, rec);
     if (store === "states") paintStateMode(); else paintQuestionsMode();
     syncDerived();
@@ -3482,8 +3626,36 @@ function runPreview(rec) {
     const n = Object.keys(rec.answers || {}).length;
     const hasT = (rec.thresholds && Object.keys(rec.thresholds).length) || rec.globalThresholds;
     return (rec.model || "saved") + " · " + n + (n === 1 ? " answer" : " answers") +
+           (statsLine(rec.stats) ? " · " + statsLine(rec.stats) : "") +
            (rec.payload ? " · own run" : (rec.questionsName ? " · " + rec.questionsName : "")) +
            (hasT ? " · thresholds" : "");
+}
+
+/** The measured facts about a run, rendered the way the runs list shows them:
+ *  200 · 1075 ms · 12,161 tok · $0.000511 */
+function statsLine(s) {
+    if (!s) return "";
+    const bits = [];
+    if (s.status) bits.push(String(s.status));
+    if (typeof s.ms === "number" && s.ms) bits.push(s.ms + " ms");
+    if (typeof s.tokensIn === "number" && s.tokensIn) bits.push(s.tokensIn.toLocaleString() + " tok");
+    if (typeof s.cost === "number" && s.cost) bits.push(usd(s.cost));
+    if (s.requestId) bits.push(s.requestId);
+    return bits.join(" · ");
+}
+
+/** Pull the measured facts off a live group so they can be stored with it. */
+function statsOf(g) {
+    const r = (g.runs || []).filter(function (x) { return x.ok; })[0] || (g.runs || [])[0] || {};
+    const out = {};
+    if (r.status) out.status = r.status;
+    if (typeof r.ms === "number") out.ms = r.ms;
+    if (typeof g.tokensIn === "number") out.tokensIn = g.tokensIn;
+    if (typeof g.cost === "number") out.cost = g.cost;
+    if (r.requestId) out.requestId = r.requestId;
+    if (r.envelope) out.envelope = r.envelope;
+    out.runCount = (g.runs || []).length;
+    return out;
 }
 
 /** Put the cut-offs a saved run was read under back into the session. */
@@ -3502,13 +3674,18 @@ function applyRunThresholds(rec) {
 function runGroupFrom(rec) {
     const payload = runRecordPayload(rec);
     if (!payload) return null;
+    const st2 = rec.stats || {};
     return {
         id: uid() + "-saved", at: rec.at || Date.now(), kind: "saved", label: rec.name,
         payload: payload, rowNoun: "run",
+        /* the line the run showed when it was saved, numbers and all */
         meta: runPreview(rec) + (rec.note ? " · " + rec.note : ""),
+        tokensIn: st2.tokensIn, cost: st2.cost, stats: clone(st2),
+        stateName: rec.stateName, questionsName: rec.questionsName,
         thresholds: rec.thresholds ? clone(rec.thresholds) : undefined,
         globalThresholds: rec.globalThresholds ? clone(rec.globalThresholds) : undefined,
-        runs: [{ ok: true, status: 200, ms: 0, label: rec.model || "saved", model: rec.model,
+        runs: [{ ok: true, status: st2.status || 200, ms: st2.ms || 0, requestId: st2.requestId,
+                 envelope: st2.envelope, label: rec.model || "saved", model: rec.model,
                  answers: rec.answers, raw: { model: rec.model, answers: rec.answers } }]
     };
 }
@@ -3594,6 +3771,9 @@ function applicableRuns() {
 function loadRunEverything(rec) {
     const payload = runRecordPayload(rec);
     if (!payload) { toast("The question set this run refers to is not in the library"); return; }
+    rememberUndo("loading that run", (function (snap) {
+        return function () { restoreEditors(snap); };
+    })(editorSnapshot()));
     if (payload.state !== undefined) {
         if (typeof payload.state === "string") { st.text = payload.state; st.mode = "text"; }
         else { st.root = valueToField("", payload.state); st.mode = "builder"; }
@@ -3608,6 +3788,28 @@ function loadRunEverything(rec) {
     syncDerived();
     loadRunRecord(rec);          /* closes the library and shows the answers */
     toast("Loaded " + rec.name + " with its state and questions");
+}
+
+/** The two half-matches: runs sharing this state but judged by other questions,
+ *  and runs sharing these questions but about another state. */
+function runScopes() {
+    const sNames = matchingRecords("states").map(function (r) { return r.name; });
+    const qNames = matchingRecords("questions").map(function (r) { return r.name; });
+    const all = lib.cache.runs || [];
+    const inS = function (r) { return sNames.indexOf(r.stateName) >= 0; };
+    const inQ = function (r) { return qNames.indexOf(r.questionsName) >= 0; };
+    return {
+        sNames: sNames, qNames: qNames,
+        pair: (sNames.length && qNames.length) ? all.filter(function (r) { return inS(r) && inQ(r); }) : [],
+        sameStateOtherQuestions: sNames.length ? all.filter(function (r) { return inS(r) && !inQ(r); }) : [],
+        sameQuestionsOtherState: qNames.length ? all.filter(function (r) { return inQ(r) && !inS(r); }) : []
+    };
+}
+
+/** Open the library runs tab showing only one of those scopes. */
+function openRunScope(kind) {
+    libRunScope = kind;
+    openLibrary("runs", "");
 }
 
 /** Saved runs that are not already sitting in this tab's runs list. */
@@ -3682,13 +3884,31 @@ function saveRunRecord(group, existing) {
         }
         const rec = { name: name, model: run.model || "this tester", answers: run.answers,
                       payload: g.payload, meta: g.meta, at: g.at || Date.now(), updatedAt: Date.now() };
+        /* the measured facts: status, latency, tokens, cost, request id */
+        rec.stats = Object.assign({}, g.stats || {}, statsOf(g));
         /* Keep the cut-offs the answers were read under, so reloading this run
-           shows the same act / review / hold bands it showed when it was saved. */
+           shows the same bands it showed when it was saved. */
         const perQuestion = g.thresholds || qs.thresholds;
         if (perQuestion && Object.keys(perQuestion).length) rec.thresholds = clone(perQuestion);
         rec.globalThresholds = clone(g.globalThresholds || thresholds);
+        /* which example this run belongs to, so it can be found again by either
+           side; taken from the group if it came from the library, else from
+           whatever the editors match right now */
+        const sRec = g.stateName ? null : matchingRecords("states")[0];
+        const qRec = g.questionsName ? null : matchingRecords("questions")[0];
+        if (g.stateName || sRec) rec.stateName = g.stateName || sRec.name;
+        if (g.questionsName || qRec) rec.questionsName = g.questionsName || qRec.name;
         if (existing) rec.id = existing.id;
         return dbPut("runs", rec).then(refreshCache).then(function () {
+            /* the run in the list is this record now, so it should say so
+               without a trip through the library */
+            g.label = name;
+            g.savedAs = name;
+            g.stats = clone(rec.stats);
+            g.stateName = rec.stateName;
+            g.questionsName = rec.questionsName;
+            saveRuns();
+            renderOut();
             if (libOpen) renderLibrary();
             toast("Saved " + name);
         });
@@ -3908,6 +4128,10 @@ const LIB_TABS = [
 let libOpen = false;
 let libTab = "urls";
 let libFilter = "";
+/* when the runs tab was opened from one of the half-match offers */
+let libRunScope = null;
+/* run ids ticked for a bulk load */
+let libRunPicks = [];
 
 function openLibrary(tab, filter) {
     libTab = tab || libTab;
@@ -3943,7 +4167,10 @@ el.libRestore.addEventListener("click", function () {
 });
 
 function renderLibrary() {
-    buildTabs(el.libTabs, LIB_TABS, libTab, function (t) { libTab = t; renderLibrary(); });
+    buildTabs(el.libTabs, LIB_TABS, libTab, function (t) {
+        if (t !== "runs") { libRunScope = null; libRunPicks = []; }
+        libTab = t; renderLibrary();
+    });
     el.libToolbar.textContent = "";
     el.libBody.textContent = "";
     if (libTab === "defaults") { renderDefaultsTab(); return; }
@@ -3951,7 +4178,15 @@ function renderLibrary() {
     const store = libTab;
     const all = (lib.cache[store] || []).slice().sort(function (a, b) { return String(a.name || "").localeCompare(String(b.name || "")); });
     const needle = libFilter.trim().toLowerCase();
-    const rows = needle ? all.filter(function (r) { return String(r.name || "").toLowerCase().indexOf(needle) >= 0; }) : all;
+    let rows = needle ? all.filter(function (r) { return String(r.name || "").toLowerCase().indexOf(needle) >= 0; }) : all;
+    /* a scope narrows the runs tab to one half-match before the name filter */
+    let scopeSet = null;
+    if (store === "runs" && libRunScope) {
+        const sc = runScopes();
+        scopeSet = sc[libRunScope] || [];
+        const ids = scopeSet.map(function (r) { return r.id; });
+        rows = rows.filter(function (r) { return ids.indexOf(r.id) >= 0; });
+    }
 
     if (store === "urls" || store === "tokens") {
         el.libToolbar.appendChild(smallBtn("Add from the field above", function () { saveConnRecord(store); }, "indigo"));
@@ -3965,6 +4200,18 @@ function renderLibrary() {
             el.libToolbar.appendChild(smallBtn(applicableLabel(hit, pending), function () { loadRunRecords(pending); },
                 "indigo", applicableTitle(hit)));
         }
+        const picked = rows.filter(function (r) { return libRunPicks.indexOf(r.id) >= 0; });
+        el.libToolbar.appendChild(smallBtn(picked.length ? "Load " + picked.length + " selected" : "Load selected",
+            function () {
+                if (!picked.length) { toast("Tick the runs to load first"); return; }
+                loadRunRecords(picked);
+                libRunPicks = [];
+            }, picked.length ? "violet" : "plain", "Load every ticked run into the runs list at once"));
+        el.libToolbar.appendChild(smallBtn(picked.length === rows.length && rows.length ? "Select none" : "Select all",
+            function () {
+                libRunPicks = (picked.length === rows.length) ? [] : rows.map(function (r) { return r.id; });
+                renderLibrary();
+            }, "plain", "Tick or untick everything in the list below"));
         if (hit.how === "pair") {
             el.libToolbar.appendChild(smallBtn("Filter to this example", function () {
                 libFilter = hit.state.name; renderLibrary();
@@ -4035,6 +4282,16 @@ function renderLibrary() {
             text: "A saved set is the global bands plus every per-question override, kept apart from any question set. " +
                   "Loading one replaces both. Thresholds are also saved inside a question set, so either route works." }));
     }
+    if (store === "runs" && libRunScope) {
+        const label = libRunScope === "sameStateOtherQuestions"
+            ? "runs about the state in the editor, judged by a different question set"
+            : "runs judged by the question set in the editor, about a different state";
+        el.libBody.appendChild(h("div", { class: "mb-3 flex items-center gap-2 flex-wrap text-xs text-violet-800 bg-violet-50 border border-violet-200 rounded-lg px-2 py-1.5" }, [
+            h("span", { text: "Showing " + label + "." }),
+            smallBtn("Show all runs", function () { libRunScope = null; libRunPicks = []; renderLibrary(); }, "plain",
+                "Drop this filter and list every saved run")
+        ]));
+    }
     if (store === "runs") {
         el.libBody.appendChild(h("p", { class: "mb-3 text-xs text-slate-500",
             text: "Load a run to read its answers, then mark it A and one of your own B in the Runs view to compare them. " +
@@ -4060,6 +4317,17 @@ function libRow(store, rec) {
                 onchange: function () { setDefaultRecord(store, rec.id).then(function () { renderLibrary(); refreshPickers(); }); } }),
             "default"
         ]));
+    }
+    if (store === "runs") {
+        const on = libRunPicks.indexOf(rec.id) >= 0;
+        row.appendChild(h("input", { type: "checkbox", checked: on, "aria-label": "Select " + recordName(store, rec),
+            class: "rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shrink-0",
+            title: "Tick to load several runs at once",
+            onchange: function (ev) {
+                if (ev.target.checked) { if (!on) libRunPicks.push(rec.id); }
+                else libRunPicks = libRunPicks.filter(function (x) { return x !== rec.id; });
+                renderLibrary();
+            } }));
     }
     if (locked) {
         row.appendChild(h("div", { class: "w-[13rem] shrink-0 flex items-center gap-1.5" }, [
@@ -4118,13 +4386,13 @@ function libRow(store, rec) {
 
     const acts = h("div", { class: "flex items-center gap-1 shrink-0" });
     if (store === "urls" || store === "tokens") {
-        acts.appendChild(smallBtn("Use", function () {
+        acts.appendChild(smallBtn(store === "urls" ? "Load URL" : "Load Token", function () {
             if (store === "urls") { el.serverUrl.value = rec.url || ""; el.urlPicker.value = String(rec.id); }
             else { el.bearerToken.value = rec.token || ""; el.tokenPicker.value = String(rec.id); }
             toast("Using " + recordName(store, rec));
         }));
     } else if (store === "thresholds") {
-        acts.appendChild(smallBtn("Load", function () {
+        acts.appendChild(smallBtn("Load Thresholds", function () {
             if (applyThresholdConfig(rec, recordName(store, rec))) closeLibrary();
         }, "plain", "Use these bands and overrides now"));
         acts.appendChild(smallBtn("Copy", function () {
@@ -4132,15 +4400,18 @@ function libRow(store, rec) {
                                              overrides: rec.overrides }, null, 2), "Thresholds");
         }, "plain", "Copy this set as JSON"));
         if (!locked) {
-            acts.appendChild(smallBtn("Update", function () { saveThresholdRecord(rec); }, "plain",
-                "Overwrite this entry with the thresholds in the editor"));
+            acts.appendChild(smallBtn("Update", function () {
+                confirmDanger({ title: "Overwrite " + recordName(store, rec) + "?", confirmText: "Overwrite",
+                                desc: "Replaces the saved bands and overrides with the ones in the editor." },
+                    function () { saveThresholdRecord(rec); });
+            }, "plain", "Overwrite this entry with the thresholds in the editor"));
         }
     } else if (store === "runs") {
         /* the whole example in one click: the payload that produced the run,
            and the run itself to read its answers against */
         acts.appendChild(smallBtn("Load all", function () { loadRunEverything(rec); }, "violet",
             "Replace State and Questions from this run and load its answers"));
-        acts.appendChild(smallBtn("Load", function () { loadRunRecord(rec); }, "plain",
+        acts.appendChild(smallBtn("Load Run", function () { loadRunRecord(rec); }, "plain",
             "Show this run's answers in the Answers view"));
         acts.appendChild(smallBtn("State and Questions", function () {
             usePayload(runRecordPayload(rec), rec.name, "both");
@@ -4162,18 +4433,34 @@ function libRow(store, rec) {
                 "Set the session cut-offs to the ones this run was read under"));
         }
         if (!locked) {
-            acts.appendChild(smallBtn("Update", function () { saveRunRecord(null, rec); }, "plain",
-                "Overwrite this entry with the run showing in the Answers view"));
+            acts.appendChild(smallBtn("Update", function () {
+                confirmDanger({ title: "Overwrite " + recordName(store, rec) + "?", confirmText: "Overwrite",
+                                desc: "Replaces the saved answers with the run showing in the Answers view." },
+                    function () { saveRunRecord(null, rec); });
+            }, "plain", "Overwrite this entry with the run showing in the Answers view"));
         }
     } else {
-        acts.appendChild(smallBtn("Load", function () { loadDoc(store, rec); }));
+        acts.appendChild(smallBtn(store === "states" ? "Load State" : "Load Questions",
+            function () { loadDoc(store, rec); }, "plain",
+            "Replace the " + (store === "states" ? "State" : "Questions") + " editor with this entry"));
         if (!locked) {
             acts.appendChild(smallBtn("Update", function () {
-                const doc = currentDoc(store);
-                if (!doc) return;
-                const r2 = clone(rec); r2.mode = doc.mode; r2.value = doc.value; r2.updatedAt = Date.now();
-                if (doc.thresholds) r2.thresholds = doc.thresholds;
-                dbPut(store, r2).then(refreshCache).then(function () { renderLibrary(); toast("Updated " + recordName(store, rec)); });
+                confirmDanger({ title: "Overwrite " + recordName(store, rec) + "?", confirmText: "Overwrite",
+                                desc: "Replaces the saved entry with what is in the editor now. The Undo button puts the old one back." },
+                    function () {
+                        const doc = currentDoc(store);
+                        if (!doc) return;
+                        const before = clone(rec);
+                        const r2 = clone(rec); r2.mode = doc.mode; r2.value = doc.value; r2.updatedAt = Date.now();
+                        if (doc.thresholds) r2.thresholds = doc.thresholds;
+                        if (doc.globalThresholds) r2.globalThresholds = doc.globalThresholds;
+                        dbPut(store, r2).then(refreshCache).then(function () {
+                            rememberUndo("overwriting " + recordName(store, before), function () {
+                                dbPut(store, before).then(refreshCache).then(function () { renderLibrary(); refreshPickers(); });
+                            });
+                            renderLibrary(); toast("Updated " + recordName(store, rec));
+                        });
+                    });
             }, "plain", "Overwrite this entry with the current editor content"));
         }
     }
@@ -4183,13 +4470,26 @@ function libRow(store, rec) {
             text: "read-only" }));
     } else {
         acts.appendChild(trashBtn("Delete", function () {
-            openModal({ title: "Delete " + recordName(store, rec) + "?", desc: "This cannot be undone.", confirmText: "Delete", danger: true,
+            openModal({ title: "Delete " + recordName(store, rec) + "?",
+                desc: "The Undo button in the header puts it back.", confirmText: "Delete", danger: true,
                 onConfirm: function () {
+                    const before = clone(rec);
+                    const wasDefault = lib.defaults[store] && lib.defaults[store].id === rec.id;
                     return dbDelete(store, rec.id).then(function () {
-                        if (lib.defaults[store] && lib.defaults[store].id === rec.id) return dbDelete("defaults", store);
-                    }).then(refreshCache).then(function () { renderLibrary(); refreshPickers(); toast("Deleted"); return true; });
+                        if (wasDefault) return dbDelete("defaults", store);
+                    }).then(refreshCache).then(function () {
+                        rememberUndo("deleting " + recordName(store, before), function () {
+                            dbPut(store, before).then(function () {
+                                if (wasDefault) return dbPut("defaults", { store: store, id: before.id });
+                            }).then(refreshCache).then(function () {
+                                if (libOpen) renderLibrary();
+                                refreshPickers();
+                            });
+                        });
+                        renderLibrary(); refreshPickers(); toast("Deleted"); return true;
+                    });
                 } });
-        }));
+        }, null, true));
     }
     row.appendChild(acts);
     return row;
